@@ -77,5 +77,6 @@ jobs:
           OCI_COMPARTMENT_ID: ${{ vars.OCI_COMPARTMENT_ID }}
           OCI_SUBNET_ID: ${{ vars.OCI_SUBNET_ID }}
           OCI_IMAGE_ID: ${{ vars.OCI_IMAGE_ID }}
+          OCI_IMAGE_MODE: ${{ vars.OCI_IMAGE_MODE }}
           OCI_FREE_CONFIG_APPROVED: ${{ vars.OCI_FREE_CONFIG_APPROVED }}
         run: python oci_retry_micro.py --operation "$OPERATION"

@@ -14,7 +14,7 @@
 | FD | 不指定，由 OCI 自动分配 |
 | 目标 | `e2-micro-singapore-2`，只为已有一台 RUNNING E2 的账号创建第二台 |
 | 网络 | 只读取并使用你指定的已有子网；新实例关联一个新 VNIC，不修改既有网络配置或其他实例 IP |
-| 镜像 | 你明确指定的 Oracle 官方 Ubuntu 22.04 或 24.04 平台镜像，检查与 Micro 兼容；拒绝自定义/社区/Pro 变体 |
+| 镜像 | 默认 `platform`：官方 Ubuntu 22.04/24.04；设为 `custom`：使用本租户已有自定义 Linux 镜像，仍检查 Micro 兼容性和 50 GB 启动卷限制 |
 | 新启动卷 | 固定 50 GB、10 VPUs/GB；不附加其他块卷，不创建备份 |
 | 额度 | 检查根区间及目标区间的 E2 服务可用量，且所有可见区间当前仅有一台未终止 E2 |
 | 存储 | 枚举主区域各 AD、根区间及所有活动子区间；现有启动卷和块卷加 50 GB 须不超过 200 GB |
@@ -38,7 +38,7 @@
 | `OCI_TENANCY` | 你的租户 OCID |
 | `OCI_FINGERPRINT` | 对应 API 公钥的指纹 |
 | `OCI_PRIVATE_KEY` | 对应 OCI API 私钥 PEM 的完整内容；只填入此 Secret |
-| `OCI_SSH_PUBLIC_KEY` | 新实例登录所用 SSH **公钥**的完整一行，如 `ssh-ed25519 ...`；对应 SSH 私钥自行保管 |
+| `OCI_SSH_PUBLIC_KEY` | 新实例登录所用 SSH **公钥**的完整一行，如 `ssh-ed25519 ...`；对应 SSH 私钥自行保管；自定义镜像须能处理 OCI 的 SSH 公钥元数据 |
 | `OCI_KEY_PASSPHRASE` | 可选；API 私钥加密口令，没有则不设置 |
 
 此版本不需要 `GH_PAT`，也不需要创建新的 GitHub PAT。工作流使用 GitHub 提供的短期 `GITHUB_TOKEN`。OCI API 密钥与 SSH 登录密钥是两套不同凭据，不能混填。
@@ -50,7 +50,8 @@
 | Variable | 填什么 |
 | --- | --- |
 | `OCI_SUBNET_ID` | 已有的新加坡公共子网 OCID；保留该子网的现有安全规则和路由 |
-| `OCI_IMAGE_ID` | 明确选定的官方 Ubuntu x86 平台镜像 OCID；必须为新加坡镜像且支持 Micro |
+| `OCI_IMAGE_ID` | 所选新加坡镜像的完整 OCID；`platform` 模式填官方 Ubuntu，`custom` 模式填本租户已有自定义镜像 |
+| `OCI_IMAGE_MODE` | 可选，默认 `platform`；使用自定义镜像时明确填 `custom` |
 | `OCI_COMPARTMENT_ID` | 可选；留空使用租户根区间，与你此前日志一致 |
 | `OCI_FREE_CONFIG_APPROVED` | 初始留空或 `false`。先看 `plan`，核实费用后才设置为 `true` |
 
@@ -58,13 +59,44 @@
 
 **费用确认的实际边界：** 程序可核对主区域、型号、平台镜像、服务额度和共同存储容量，并固定新卷性能；不能替代 Oracle 的实际计费和免费适用标记。PAYG 下仍应在控制台核实所选镜像、新卷及其他关联资源符合你的免费条件，再将 `OCI_FREE_CONFIG_APPROVED` 设为 `true`。这不是零费用保证，也不会影响或降低你现有卷的 120 VPUs/GB 配置。
 
+### 使用已有自定义镜像
+
+支持你已在 OCI 导入或保存的自定义 Linux 镜像，例如 Alpine、Debian 或自行定制的 Ubuntu。不需要把镜像文件上传到 GitHub，也不用更换其他 Secrets。
+
+1. 如果此前已经运行 `start`，先手动运行 `operation=pause`，并等待当前运行结束。尚未启动过则直接下一步。
+2. OCI 控制台切换到新加坡 `ap-singapore-1`，进入 **计算 → 自定义映像（Custom images）**，打开你的镜像。
+3. 确认状态是 **可用 / AVAILABLE**，复制镜像 **OCID**，不是文件下载地址、对象存储地址或启动卷 OCID。
+4. 在 GitHub **Settings → Secrets and variables → Actions → Variables** 设置：
+
+   | Name | Value |
+   | --- | --- |
+   | `OCI_IMAGE_MODE` | `custom` |
+   | `OCI_IMAGE_ID` | 上一步复制的 `ocid1.image.oc1.ap-singapore-1.…` |
+   | `OCI_FREE_CONFIG_APPROVED` | 先填 `false`，核实计划和费用后再改为 `true` |
+
+5. 其他配置沿用；镜像所在区间可以和新实例的目标区间不同，但必须属于本租户的活动区间且 API 用户有访问权限。`OCI_COMPARTMENT_ID` 仍表示**新实例的目标区间**。
+6. 手动运行 `plan`。确认结果中 `image_mode=custom`、启动卷总用量和容量信息。准备启动时，按下文操作重新 `start`。
+
+自定义镜像的要求：
+
+- **AMD x86_64 / amd64 架构**，不能用 A1 的 aarch64 / arm64 镜像。程序会拒绝名称或 OS 标签中明确带有 aarch64/arm64 的镜像，但这些标签不足以证明镜像实际架构；你仍须确认源文件架构。
+- OCI 的镜像形状兼容性查询必须包含 `VM.Standard.E2.1.Micro`。程序不会自动给镜像添加兼容项；有兼容项也不代表已经通过实际启动测试。
+- 镜像所需启动卷容量必须不超过 **50 GB**。这里检查的是虚拟启动盘需求，不是下载的 QCOW2 文件大小；大于 50 GB 会停止，不会自动扩容。
+- 镜像的启动配置必须适用于 E2。接受 `NATIVE`、`PARAVIRTUALIZED` 或 `CUSTOM` 元数据，拒绝仿真或未知模式。程序不覆盖镜像的固件/启动选项，不会把 UEFI 强行改成 BIOS；源镜像、驱动及镜像能力设置是否匹配仍须你核实。
+- 镜像应具备 OCI cloud-init 或等效机制，能读取 `ssh_authorized_keys` 元数据、配置网络并启动 SSH。否则即使 OCI 创建成功，也可能不能用上述公钥登录；登录用户名由镜像决定，不固定为 `ubuntu`。
+- 自定义模式不支持 Windows，仍拒绝社区目录/Marketplace listing。它不能识别自定义镜像内部的软件许可证或订阅，需由你确认 Linux 系统和内置软件没有不接受的费用。
+
+**自定义镜像存储可能单独计费。** Oracle 官方将保存的自定义镜像列为计费项；这与新实例的 E2 额度、启动卷/块卷 200 GB 检查分开。`plan` 显示 `custom_image_storage_billable_gb`（API 未提供时为 `null`，不是 0）及两条人工审查提示，但不提供价格估算，也不会复制、导入、删除或新建镜像。费用确认变量不代表程序能证明镜像完全免费。
+
+若更换镜像或模式，必须重新 `plan`、人工核实后 `start`；配置摘要变化会阻止旧活动任务继续创建。本次新增镜像模式也会使旧版本活动任务的摘要失效。不要通过删除状态分支绕过检查。
+
 ## 2. 先运行只读计划
 
 打开 **Actions → E2 Micro - one attempt every 30 minutes**。如果 Fork 的工作流尚未启用，先启用 Actions；这不会将任务切换为 active。
 
 点击 **Run workflow**，分支选 `main`，`operation` 选 `plan`，确认文本留空。
 
-`plan` 会查询 OCI 数据并生成容量报告，展示主区域、形状、目标名称、50 GB/10 VPU、现有数量和存储、容量状态及配置摘要哈希。它不会调用实例创建 API，不写入持久任务状态，也不会创建或修改网络。
+`plan` 会查询 OCI 数据并生成容量报告，展示主区域、形状、目标名称、50 GB/10 VPU、现有数量和存储、镜像模式/最小启动卷/固件信息、容量状态及配置摘要哈希。自定义镜像还展示需人工核实的存储、许可、架构及 SSH 提示。它不会调用实例创建 API，不写入持久任务状态，也不会创建或修改网络。
 
 所有实际资源 OCID 来自你在 GitHub 配置的值，日志不输出 API 私钥、SSH 公钥、实例 OCID或公网 IP。容量 Request ID 可保留供排查。
 
@@ -135,5 +167,8 @@ python -m unittest discover -s tests -v
 
 - [Oracle Always Free](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm)
 - [OCI Python ComputeClient](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/client/oci.core.ComputeClient.html)
+- [OCI 自定义镜像、存储计费与区间权限](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/managingcustomimages.htm)
+- [BYOI 架构、驱动与启动模式](https://docs.oracle.com/en-us/iaas/Content/Compute/References/bringyourownimage.htm)
+- [自定义镜像形状兼容性与实际启动测试](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/custom-images-edit.htm)
 - [GitHub schedule 行为](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
 - [GitHub workflow token 权限](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication)

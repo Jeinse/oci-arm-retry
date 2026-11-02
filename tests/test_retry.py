@@ -1,4 +1,5 @@
 import copy
+from dataclasses import replace
 import json
 from types import SimpleNamespace as Obj
 import unittest
@@ -296,10 +297,137 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaisesRegex(m.GuardError, 'NO_REPLACEMENT'):
             self.g.inspect()
 
-    def test_custom_image_rejected(self):
+    def test_custom_image_still_requires_explicit_custom_mode(self):
         self.g.compute.get_image.return_value.data.compartment_id = TENANCY
         with self.assertRaisesRegex(m.GuardError, 'OFFICIAL_UBUNTU'):
             self.g.inspect()
+
+    def use_custom_image(self, **changes):
+        self.g.settings = replace(self.g.settings, image_mode='custom')
+        values = dict(lifecycle_state='AVAILABLE', compartment_id=TENANCY,
+            operating_system='Alpine Linux', operating_system_version='3.23',
+            display_name='my-production-alpine-x86_64', size_in_mbs=4096, listing_type='NONE',
+            launch_mode='PARAVIRTUALIZED', launch_options=oci.core.models.LaunchOptions(firmware='UEFI_64'),
+            billable_size_in_gbs=2)
+        values.update(changes)
+        self.g.compute.get_image.return_value.data = oci.core.models.Image(**values)
+
+    def test_owned_alpine_custom_image_supported_and_boot_settings_not_overridden(self):
+        self.use_custom_image()
+        plan = self.g.inspect()
+        self.assertEqual(plan['image_mode'], 'custom')
+        self.assertEqual(plan['image_minimum_boot_gb'], 4)
+        self.assertEqual(plan['image_firmware'], 'UEFI_64')
+        self.assertEqual(plan['image_launch_mode'], 'PARAVIRTUALIZED')
+        self.assertEqual(plan['custom_image_storage_billable_gb'], 2)
+        self.assertTrue(plan['image_review_required'])
+        self.assertEqual(len(plan['image_warnings']), 2)
+        self.assertNotIn('my-production-alpine', json.dumps(plan))
+        self.g.compute.launch_instance.assert_not_called()
+        self.g.compute.launch_instance.return_value = Obj(data=Obj(id='target', lifecycle_state='PROVISIONING'), headers={})
+        self.g.launch(plan, 'token')
+        body = self.g.compute.launch_instance.call_args.args[0]
+        self.assertEqual(body.source_details.image_id, self.g.settings.image)
+        self.assertEqual(body.source_details.boot_volume_size_in_gbs, 50)
+        self.assertIsNone(body.launch_options)
+        self.assertIsNone(body.platform_config)
+        self.assertEqual(body.metadata['ssh_authorized_keys'], PUBLIC)
+
+    def test_custom_plan_does_not_launch_or_change_campaign_state(self):
+        self.use_custom_image()
+        store = MemoryStore()
+        result = m.run('plan', store, lambda config: self.g, lambda: self.g.settings)
+        self.assertEqual(result['status'], 'READ_ONLY_PLAN')
+        self.assertEqual(result['image_mode'], 'custom')
+        self.assertEqual(store.history, [])
+        self.g.compute.launch_instance.assert_not_called()
+
+    def test_custom_launch_still_requires_owner_free_configuration_approval(self):
+        self.use_custom_image()
+        self.g.settings = replace(self.g.settings, free_approved=False)
+        store = MemoryStore()
+        result = m.run('start', store, lambda config: self.g, lambda: self.g.settings, m.CONFIRMATION)
+        self.assertEqual(result['status'], 'STOPPED_FOR_REVIEW')
+        self.g.compute.get_image.assert_not_called()
+        self.g.compute.launch_instance.assert_not_called()
+
+    def test_custom_image_in_other_active_compartment_allowed(self):
+        self.use_custom_image(compartment_id=COMP)
+        self.compartments = [Obj(id=COMP, lifecycle_state='ACTIVE')]
+        self.assertEqual(self.g.inspect()['image_mode'], 'custom')
+
+    def test_custom_mode_rejects_platform_or_foreign_compartment_image(self):
+        for compartment in (None, 'ocid1.compartment.oc1..foreign'):
+            with self.subTest(compartment=compartment):
+                self.use_custom_image(compartment_id=compartment)
+                with self.assertRaisesRegex(m.GuardError, 'BELONG_TO_THIS_TENANCY'):
+                    self.g.inspect()
+        self.g.compute.create_compute_capacity_report.assert_not_called()
+
+    def test_custom_arm_image_is_rejected_even_when_shape_metadata_claims_micro(self):
+        for name in ('oci-alpine-aarch64-uefi', 'Alpine_ARM64_custom'):
+            with self.subTest(name=name):
+                self.use_custom_image(display_name=name)
+                with self.assertRaisesRegex(m.GuardError, 'ARM_CUSTOM_IMAGE'):
+                    self.g.inspect()
+
+    def test_windows_custom_image_rejected(self):
+        self.use_custom_image(operating_system='Windows Server')
+        with self.assertRaisesRegex(m.GuardError, 'WINDOWS_CUSTOM_IMAGE'):
+            self.g.inspect()
+
+    def test_custom_community_image_rejected(self):
+        self.use_custom_image(listing_type='COMMUNITY')
+        with self.assertRaisesRegex(m.GuardError, 'COMMUNITY_OR_MARKETPLACE'):
+            self.g.inspect()
+
+    def test_importing_custom_image_rejected(self):
+        self.use_custom_image(lifecycle_state='IMPORTING')
+        with self.assertRaisesRegex(m.GuardError, 'IMAGE_NOT_AVAILABLE'):
+            self.g.inspect()
+
+    def test_custom_image_with_unsupported_or_unknown_launch_mode_rejected(self):
+        for mode in ('EMULATED', 'UNKNOWN_ENUM_VALUE', None):
+            with self.subTest(mode=mode):
+                self.use_custom_image(launch_mode=mode)
+                with self.assertRaisesRegex(m.GuardError, 'LAUNCH_MODE_NOT_SUPPORTED'):
+                    self.g.inspect()
+
+    def test_custom_image_without_os_metadata_rejected(self):
+        self.use_custom_image(operating_system='')
+        with self.assertRaisesRegex(m.GuardError, 'OS_METADATA_REQUIRED'):
+            self.g.inspect()
+
+    def test_custom_image_larger_than_fixed_boot_volume_rejected(self):
+        self.use_custom_image(size_in_mbs=50 * 1024 + 1)
+        with self.assertRaisesRegex(m.GuardError, 'LARGER_BOOT_VOLUME'):
+            self.g.inspect()
+
+    def test_custom_image_unknown_or_invalid_virtual_disk_size_rejected(self):
+        for size in (None, 0, -1, float('nan'), True):
+            with self.subTest(size=size):
+                self.use_custom_image(size_in_mbs=size)
+                with self.assertRaisesRegex(m.GuardError, 'UNKNOWN_IMAGE_BOOT_VOLUME_SIZE'):
+                    self.g.inspect()
+
+    def test_custom_image_unknown_storage_billing_size_not_reported_as_free(self):
+        self.use_custom_image(billable_size_in_gbs=None)
+        plan = self.g.inspect()
+        self.assertIsNone(plan['custom_image_storage_billable_gb'])
+        self.assertTrue(plan['image_review_required'])
+
+    def test_custom_image_without_e2_compatibility_rejected(self):
+        self.use_custom_image()
+        original = self.g.all
+        def incompatible(method, *args, **kwargs):
+            if method._mock_name == 'list_shapes':
+                self.assertEqual(kwargs['image_id'], self.g.settings.image)
+                return [Obj(shape='VM.Standard.A1.Flex')]
+            return original(method, *args, **kwargs)
+        self.g.all = incompatible
+        with self.assertRaisesRegex(m.GuardError, 'IMAGE_NOT_COMPATIBLE_WITH_E2_MICRO'):
+            self.g.inspect()
+        self.g.compute.create_compute_capacity_report.assert_not_called()
 
     def test_unapproved_home_region_rejected(self):
         original = self.g.all
@@ -399,6 +527,8 @@ class RepoTests(unittest.TestCase):
         self.assertFalse(workflow['concurrency']['cancel-in-progress'])
         self.assertNotIn('GH_PAT',text)
         self.assertNotIn('workflow_run',triggers)
+        env=workflow['jobs']['micro']['steps'][-1]['env']
+        self.assertEqual(env['OCI_IMAGE_MODE'], '${{ vars.OCI_IMAGE_MODE }}')
         self.assertFalse(Path('.github/workflows/oci_retry.yml').exists())
 
     def test_settings_reject_other_region_and_private_ssh_key(self):
@@ -406,6 +536,12 @@ class RepoTests(unittest.TestCase):
              'OCI_SUBNET_ID':'ocid1.subnet.oc1.ap-singapore-1.test','OCI_IMAGE_ID':'ocid1.image.oc1.ap-singapore-1.test',
              'OCI_SSH_PUBLIC_KEY':PUBLIC,'GITHUB_REPOSITORY':'Jeinse/oci-arm-retry'}
         self.assertEqual(m.Settings.from_env(env).subnet,env['OCI_SUBNET_ID'])
+        self.assertEqual(m.Settings.from_env(env).image_mode, 'platform')
+        custom = m.Settings.from_env({**env, 'OCI_IMAGE_MODE': 'custom'})
+        self.assertEqual(custom.image_mode, 'custom')
+        self.assertNotEqual(custom.intent_hash(), m.Settings.from_env(env).intent_hash())
+        with self.assertRaisesRegex(m.GuardError, 'INVALID_IMAGE_MODE'):
+            m.Settings.from_env({**env, 'OCI_IMAGE_MODE': 'automatic'})
         with self.assertRaises(m.GuardError):
             m.Settings.from_env({**env,'OCI_REGION':'us-ashburn-1'})
         with self.assertRaises(m.GuardError):

@@ -82,6 +82,7 @@ class Settings:
     campaign: str
     free_approved: bool
     pass_phrase: str = ""
+    image_mode: str = "platform"
 
     @classmethod
     def from_env(cls, env=None):
@@ -96,6 +97,8 @@ class Settings:
         require(compartment.startswith(("ocid1.tenancy.oc1.", "ocid1.compartment.oc1.")), "INVALID_COMPARTMENT")
         for key, kind in (("OCI_SUBNET_ID", "subnet"), ("OCI_IMAGE_ID", "image")):
             require(env[key].startswith(f"ocid1.{kind}.oc1.{REGION}."), "WRONG_REGION_OR_RESOURCE_TYPE")
+        image_mode = env.get("OCI_IMAGE_MODE", "").strip().lower() or "platform"
+        require(image_mode in {"platform", "custom"}, "INVALID_IMAGE_MODE")
         ssh_key = env["OCI_SSH_PUBLIC_KEY"].strip()
         require("\n" not in ssh_key and "PRIVATE KEY" not in ssh_key, "SSH_PUBLIC_KEY_REQUIRED")
         require(bool(re.fullmatch(r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) [A-Za-z0-9+/=]+(?: [^\r\n]*)?", ssh_key)), "INVALID_SSH_PUBLIC_KEY")
@@ -110,11 +113,12 @@ class Settings:
                    env["OCI_IMAGE_ID"].strip(), ssh_key,
                    digest(env["GITHUB_REPOSITORY"].lower() + ":" + NAME)[:32],
                    env.get("OCI_FREE_CONFIG_APPROVED", "").lower() == "true",
-                   env.get("OCI_KEY_PASSPHRASE", ""))
+                   env.get("OCI_KEY_PASSPHRASE", ""), image_mode=image_mode)
 
     def intent_hash(self):
         return digest(json.dumps({"tenancy": self.tenancy, "compartment": self.compartment,
-            "subnet": self.subnet, "image": self.image, "ssh": self.ssh_key,
+            "subnet": self.subnet, "image": self.image, "image_mode": self.image_mode,
+            "ssh": self.ssh_key,
             "shape": SHAPE, "boot_gb": BOOT_GB, "boot_vpus": BOOT_VPUS,
             "campaign": self.campaign}, sort_keys=True))
 
@@ -153,6 +157,52 @@ class OciGateway:
             seen.add(page)
             kwargs["page"] = page
         raise GuardError("PAGINATION_LIMIT_EXCEEDED")
+
+    def inspect_image(self, compartment_ids, ad):
+        s = self.settings
+        require(s.image_mode in {"platform", "custom"}, "INVALID_IMAGE_MODE")
+        image = self.compute.get_image(s.image, retry_strategy=self.no_retry).data
+        require(image.lifecycle_state == "AVAILABLE", "IMAGE_NOT_AVAILABLE")
+        require(image.listing_type in {None, "NONE"}, "COMMUNITY_OR_MARKETPLACE_IMAGE_NOT_ALLOWED")
+        custom = s.image_mode == "custom"
+        if custom:
+            # Only an existing image in this tenancy's enumerated compartments.
+            # Never import images, add shape compatibility, or change firmware.
+            require(image.compartment_id in compartment_ids, "CUSTOM_IMAGE_MUST_BELONG_TO_THIS_TENANCY")
+            operating_system = str(image.operating_system or "").strip()
+            require(bool(operating_system), "CUSTOM_IMAGE_OS_METADATA_REQUIRED")
+            require("windows" not in operating_system.lower(), "WINDOWS_CUSTOM_IMAGE_NOT_ALLOWED")
+            label = operating_system + " " + str(image.display_name or "")
+            require(not re.search(r"(?i)(?<![a-z0-9])(?:aarch64|arm64)(?![a-z0-9])", label),
+                    "ARM_CUSTOM_IMAGE_CANNOT_RUN_ON_AMD_E2")
+            require(image.launch_mode in {"NATIVE", "PARAVIRTUALIZED", "CUSTOM"},
+                    "CUSTOM_IMAGE_LAUNCH_MODE_NOT_SUPPORTED")
+        else:
+            require(image.compartment_id is None and image.operating_system == "Canonical Ubuntu",
+                    "ONLY_OFFICIAL_UBUNTU_PLATFORM_IMAGE_ALLOWED")
+            require(image.operating_system_version in {"22.04", "24.04"}, "UNAPPROVED_UBUNTU_VERSION")
+            require("pro" not in image.display_name.lower(), "PAID_IMAGE_VARIANT_NOT_ALLOWED")
+        size = image.size_in_mbs
+        require(isinstance(size, (int, float)) and not isinstance(size, bool)
+                and math.isfinite(size) and size > 0, "UNKNOWN_IMAGE_BOOT_VOLUME_SIZE")
+        minimum_boot_gb = math.ceil(size / 1024)
+        require(minimum_boot_gb <= BOOT_GB, "IMAGE_REQUIRES_LARGER_BOOT_VOLUME")
+        shapes = self.all(self.compute.list_shapes, s.compartment, availability_domain=ad, image_id=s.image)
+        require(any(x.shape == SHAPE for x in shapes), "IMAGE_NOT_COMPATIBLE_WITH_E2_MICRO")
+        launch_mode = getattr(image, "launch_mode", None)
+        firmware = getattr(getattr(image, "launch_options", None), "firmware", None)
+        billable_size = getattr(image, "billable_size_in_gbs", None) if custom else None
+        if not (isinstance(billable_size, (int, float)) and not isinstance(billable_size, bool)
+                and math.isfinite(billable_size) and billable_size >= 0):
+            billable_size = None
+        # Do not log the image's free-form name, OS labels, OCID, or any contents.
+        return {"image_mode": s.image_mode, "image_minimum_boot_gb": minimum_boot_gb,
+                "image_launch_mode": launch_mode if launch_mode in {"NATIVE", "PARAVIRTUALIZED", "CUSTOM", "EMULATED", "ACCELERATEDPV"} else None,
+                "image_firmware": firmware if firmware in {"BIOS", "UEFI_64"} else None,
+                "custom_image_storage_billable_gb": billable_size,
+                "image_review_required": custom,
+                "image_warnings": ["CUSTOM_IMAGE_STORAGE_AND_LICENSE_COSTS_REQUIRE_OWNER_REVIEW",
+                                   "CUSTOM_IMAGE_X86_BOOT_FIRMWARE_AND_SSH_SETUP_REQUIRE_OWNER_REVIEW"] if custom else []}
 
     def inspect(self):
         s = self.settings
@@ -210,15 +260,7 @@ class OciGateway:
         require(subnet.lifecycle_state == "AVAILABLE", "SUBNET_NOT_AVAILABLE")
         require(subnet.availability_domain in {None, ad}, "SUBNET_IN_DIFFERENT_AD")
         require(subnet.prohibit_public_ip_on_vnic is False, "EXISTING_SUBNET_DOES_NOT_ALLOW_PUBLIC_IP")
-        image = self.compute.get_image(s.image, retry_strategy=self.no_retry).data
-        require(image.lifecycle_state == "AVAILABLE", "IMAGE_NOT_AVAILABLE")
-        require(image.compartment_id is None and image.operating_system == "Canonical Ubuntu", "ONLY_OFFICIAL_UBUNTU_PLATFORM_IMAGE_ALLOWED")
-        require(image.listing_type in {None, "NONE"}, "COMMUNITY_OR_MARKETPLACE_IMAGE_NOT_ALLOWED")
-        require(image.operating_system_version in {"22.04", "24.04"}, "UNAPPROVED_UBUNTU_VERSION")
-        require("pro" not in image.display_name.lower(), "PAID_IMAGE_VARIANT_NOT_ALLOWED")
-        require(isinstance(image.size_in_mbs, (int, float)) and math.ceil(image.size_in_mbs / 1024) <= BOOT_GB, "IMAGE_REQUIRES_LARGER_BOOT_VOLUME")
-        shapes = self.all(self.compute.list_shapes, s.compartment, availability_domain=ad, image_id=s.image)
-        require(any(x.shape == SHAPE for x in shapes), "IMAGE_NOT_COMPATIBLE_WITH_E2_MICRO")
+        image_plan = self.inspect_image(compartment_ids, ad)
         details = self.oci.core.models.CreateComputeCapacityReportDetails(
             compartment_id=s.tenancy, availability_domain=ad,
             shape_availabilities=[self.oci.core.models.CreateCapacityReportShapeAvailabilityDetails(instance_shape=SHAPE)])
@@ -232,7 +274,7 @@ class OciGateway:
                 "limit_available": min(quotas), "existing_storage_gb": storage,
                 "proposed_storage_gb": storage + BOOT_GB, "backup_count": len(backups),
                 "capacity": "AVAILABLE" if "AVAILABLE" in statuses else "OUT_OF_HOST_CAPACITY",
-                "capacity_request_id": response.headers.get("opc-request-id")}
+                "capacity_request_id": response.headers.get("opc-request-id"), **image_plan}
 
     def launch(self, plan, retry_token):
         s = self.settings
