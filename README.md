@@ -1,472 +1,139 @@
-# OCI Free VM Retry Script | OCI 免費 VM 搶機腳本
+# 新加坡 E2.Micro：每 30 分钟单次尝试
 
-Automated retry scripts to claim Oracle Cloud Always Free VMs (ARM A1.Flex / x86 E2.1.Micro) via GitHub Actions — no need to keep your computer on 24/7.
+此仓库是 [WendyChen330/oci-arm-retry](https://github.com/WendyChen330/oci-arm-retry) 的正式 Fork，基于上游提交 `d1c7e4eccd6b9eb32c7ea068c330c206610d624a` 修改。仅保留 E2.Micro 路径，上游的网络自动创建、ARM 工作流、90 秒循环和工作流接力已移除。
 
-🌐 [English](#english) | [繁體中文](#繁體中文)
+**默认暂停。代码提交和启用 Actions 本身不会创建 OCI 实例。由仓库所有者先运行 `plan`，检查结果后再手动运行 `start`。**
 
----
+## 固定执行计划
 
-<a name="english"></a>
-# English
+| 项目 | 此 Fork 的行为 |
+| --- | --- |
+| 地区 | `ap-singapore-1`，必须是账号主区域且订阅 READY |
+| 型号 | 仅 `VM.Standard.E2.1.Micro` |
+| AD | 从真实列表查找唯一 AD-1 |
+| FD | 不指定，由 OCI 自动分配 |
+| 目标 | `e2-micro-singapore-2`，只为已有一台 RUNNING E2 的账号创建第二台 |
+| 网络 | 只读取并使用你指定的已有子网；新实例关联一个新 VNIC，不修改既有网络配置或其他实例 IP |
+| 镜像 | 你明确指定的 Oracle 官方 Ubuntu 22.04 或 24.04 平台镜像，检查与 Micro 兼容；拒绝自定义/社区/Pro 变体 |
+| 新启动卷 | 固定 50 GB、10 VPUs/GB；不附加其他块卷，不创建备份 |
+| 额度 | 检查根区间及目标区间的 E2 服务可用量，且所有可见区间当前仅有一台未终止 E2 |
+| 存储 | 枚举主区域各 AD、根区间及所有活动子区间；现有启动卷和块卷加 50 GB 须不超过 200 GB |
+| 调度 | UTC 每小时 `:17`、`:47`，意图间隔 30 分钟；GitHub 可能延迟或跳过调度，不保证整点准时 |
+| 每次运行 | 先读容量；明确缺货就不提交创建；容量可用时至多一次 `launch_instance` |
+| 重试 | 明确主机缺货等待下次；429 退避 1 小时；其他错误停止等待审查 |
+| 成功 | 写入永久完成状态，后续不再创建；成功通知为 GitHub Issue，指派给仓库所有者 |
+| 最长活动期 | 每次手动 `start` 最长 30 天；到期暂停，可再次手动开始未完成的任务 |
 
-## Two Scripts
+程序每次都重新读取额度和资源，不把历史快照当成当前余额。例如 150 GB 现有卷 + 50 GB 新卷 = 200 GB；任何新增或扩容都会减少余量，无法完整读取时停止。
 
-| Script | Instance Type | Spec | Architecture |
-|--------|--------------|------|--------------|
-| `oci_retry.py` | VM.Standard.A1.Flex | 2 OCPU / 12 GB RAM / 100 GB disk | ARM (Ampere) |
-| `oci_retry_micro.py` | VM.Standard.E2.1.Micro | 1 OCPU / 1 GB RAM / 50 GB disk | x86 |
+## 1. 在 GitHub 页面填写配置
 
-Both are part of the Oracle Always Free tier. As of June 15, 2026, Oracle documents Always Free Ampere A1 as a total of 2 OCPUs + 12 GB memory per tenancy, while Micro remains available for up to 2 instances.
+打开本仓库 **Settings → Secrets and variables → Actions**。所有配置都由你在 GitHub 正常界面填写，不把账号密码、API 私钥或 SSH 私钥发到聊天，也不写进源码。
 
-> 📌 **Always Free update (June 15, 2026):** Oracle's official Always Free page now documents Ampere A1 as **2 OCPUs + 12 GB RAM** per tenancy, and free boot volume + block volume storage as **200 GB total per region**.  
-> Official source: https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm
+### Repository secrets
 
----
+| Secret | 填什么 |
+| --- | --- |
+| `OCI_USER` | 现有 API 凭据所属的 OCI 用户 OCID |
+| `OCI_TENANCY` | 你的租户 OCID |
+| `OCI_FINGERPRINT` | 对应 API 公钥的指纹 |
+| `OCI_PRIVATE_KEY` | 对应 OCI API 私钥 PEM 的完整内容；只填入此 Secret |
+| `OCI_SSH_PUBLIC_KEY` | 新实例登录所用 SSH **公钥**的完整一行，如 `ssh-ed25519 ...`；对应 SSH 私钥自行保管 |
+| `OCI_KEY_PASSPHRASE` | 可选；API 私钥加密口令，没有则不设置 |
 
-## Two Ways to Run
+此版本不需要 `GH_PAT`，也不需要创建新的 GitHub PAT。工作流使用 GitHub 提供的短期 `GITHUB_TOKEN`。OCI API 密钥与 SSH 登录密钥是两套不同凭据，不能混填。
 
-| Method | Best For | Pros | Cons |
-|--------|----------|------|------|
-| Run locally | Quick testing | No GitHub setup needed | Your computer must stay on |
-| GitHub Actions (recommended) | Long-term automated retrying | 24/7, no computer resources needed | Requires a **public** repo + Secrets setup |
+你可以使用已有且有相应权限的 OCI API 凭据。本次代码交付没有为你创建 API 密钥、IAM 用户或策略；是否新增任何 OCI 身份凭据，由你在正常授权界面另行决定。
 
-> 💡 **Why public repo?** Public repositories get unlimited GitHub Actions minutes for free. Private repos have a monthly limit.
+### Repository variables
 
----
+| Variable | 填什么 |
+| --- | --- |
+| `OCI_SUBNET_ID` | 已有的新加坡公共子网 OCID；保留该子网的现有安全规则和路由 |
+| `OCI_IMAGE_ID` | 明确选定的官方 Ubuntu x86 平台镜像 OCID；必须为新加坡镜像且支持 Micro |
+| `OCI_COMPARTMENT_ID` | 可选；留空使用租户根区间，与你此前日志一致 |
+| `OCI_FREE_CONFIG_APPROVED` | 初始留空或 `false`。先看 `plan`，核实费用后才设置为 `true` |
 
-## Script Configuration
+`OCI_REGION` 固定在工作流中，不需要填写。子网及镜像 OCID 可从 OCI 对应详情页复制。程序不自动选择你的其他网络或自动切换镜像，以免创建到你未确认的位置。
 
-Open the script and edit the variables at the top:
+**费用确认的实际边界：** 程序可核对主区域、型号、平台镜像、服务额度和共同存储容量，并固定新卷性能；不能替代 Oracle 的实际计费和免费适用标记。PAYG 下仍应在控制台核实所选镜像、新卷及其他关联资源符合你的免费条件，再将 `OCI_FREE_CONFIG_APPROVED` 设为 `true`。这不是零费用保证，也不会影响或降低你现有卷的 120 VPUs/GB 配置。
 
-### ARM script: `oci_retry.py`
+## 2. 先运行只读计划
 
-```python
-COMPARTMENT_ID = "ocid1.tenancy.oc1..your-ocid"
-SSH_PUBLIC_KEY = "ssh-rsa AAAA...your-public-key"
-INSTANCE_NAME = "streamlit-server"
-ARM_OCPUS = 2
-ARM_MEMORY_IN_GBS = 12
-BOOT_VOLUME_SIZE_IN_GBS = 100
-RETRY_INTERVAL = 90  # Retry interval in seconds
-```
+打开 **Actions → E2 Micro - one attempt every 30 minutes**。如果 Fork 的工作流尚未启用，先启用 Actions；这不会将任务切换为 active。
 
-> The ARM script now exposes `BOOT_VOLUME_SIZE_IN_GBS` as a configuration variable. The default is `100 GB`, which is safer under the Always Free `200 GB` regional storage quota than the old `200 GB` default.
+点击 **Run workflow**，分支选 `main`，`operation` 选 `plan`，确认文本留空。
 
-### Micro script: `oci_retry_micro.py`
+`plan` 会查询 OCI 数据并生成容量报告，展示主区域、形状、目标名称、50 GB/10 VPU、现有数量和存储、容量状态及配置摘要哈希。它不会调用实例创建 API，不写入持久任务状态，也不会创建或修改网络。
 
-```python
-COMPARTMENT_ID = "ocid1.tenancy.oc1..your-ocid"
-SSH_PUBLIC_KEY = "ssh-rsa AAAA...your-public-key"
-INSTANCE_NAME  = "micro-server"   # Change to "micro-server-2" when claiming your second Micro instance
-BOOT_VOLUME_SIZE_IN_GBS = 50
-RETRY_INTERVAL = 90  # Retry interval in seconds
-```
+所有实际资源 OCID 来自你在 GitHub 配置的值，日志不输出 API 私钥、SSH 公钥、实例 OCID或公网 IP。容量 Request ID 可保留供排查。
 
-> Each OCI account can have up to **2 free Micro instances**. To claim a second one, change `INSTANCE_NAME` to a different value (e.g. `"micro-server-2"`) so both instances can be identified separately in the OCI Console. The VCN and subnet are shared between instances automatically.
+## 3. 你手动授权实际创建并开始调度
 
-### Get Compartment ID (Tenancy OCID)
+确认只读计划与配置后：
 
-**Purpose**: Tells Oracle which account to create resources under.
+1. 在 Variables 中将 `OCI_FREE_CONFIG_APPROVED` 设置为 `true`。
+2. 再次 **Run workflow**，分支仍选 `main`，`operation` 选 `start`。
+3. 在 `confirmation` 输入框逐字输入 `CREATE_ONE_E2_MICRO`。
+4. 点击运行。这一次才会将未完成任务置为 active，并在容量可用且所有检查通过时尝试创建一台。容量不足则等待后续 cron。
 
-1. Oracle Cloud Console → top-right avatar → **Tenancy: XXX**
-2. Or: top-left menu → **Identity & Security** → **Identity** → **Compartments** → click root
-3. Copy the OCID (format: `ocid1.tenancy.oc1..xxxxxx`)
+工作流文件仅接受 `Jeinse` 所有的仓库和 `main` 分支。后续如果你有意转移仓库所有者，需要先审查并修改这一限制。
 
-### Get SSH Public Key
+## 4. 暂停、恢复、停止
 
-**Purpose**: Used to SSH into the instance after it's created.
+| 操作 | 做法 |
+| --- | --- |
+| 查看状态 | 手动运行 `operation=status` |
+| 暂停创建 | 手动运行 `operation=pause`；不需要 OCI 凭据 |
+| 恢复未完成任务 | 先运行 `plan`，再运行 `start` 并输入确认文本；不会绕过 30 分钟最小间隔 |
+| 完全停止工作流调度 | Actions 中打开此工作流，右上角 `… → Disable workflow` |
+| 重新启用调度 | `Enable workflow`；只有状态为 active 的未完成任务才会尝试 |
+| 当前任务正在进行 | 普通 pause 会按 concurrency 排队，不能撤回已经发出的 OCI 请求；取消运行也不等于撤回已提交的请求 |
 
-1. When creating an instance in Oracle Cloud, choose **Generate key pair** (Generate SSH key pair)
-2. Download two files:
-   - `*.key` or `*.pem` (private key — keep this safe, used for SSH login)
-   - `*.pub` (public key — paste into the script)
-3. Open the `.pub` file in a text editor, copy all content (starts with `ssh-rsa AAAA...`)
+如果是 `uncertain` 或 `launch_pending=true`，表示先前创建可能已被 OCI 接受，后续自动调度不再发新请求。手动 `start` 只会先检查已有目标；没有找到时继续停下，不能盲目重试。应先在 OCI 控制台确认那次请求的结果。
 
-Or generate your own key locally with `ssh-keygen`.
+## 5. 持久状态与幂等
 
----
+第一次手动开始或暂停时，工作流在同一仓库建立 `e2-retry-state` 分支，状态文件为 `state/e2-micro.json`。它不是 Actions cache，runner 换机、工作流取消或日志过期也不会丢失这个记录。
 
-## Run Locally
+- 同一个 repo 的所有本工作流操作使用同一 concurrency 组，不取消正在处理的任务。
+- 状态文件更新使用 GitHub 内容 blob SHA 作冲突检查；写入失败就不会 launch。
+- 调用创建前先记录 `launch_pending=true` 和一次性 OCI retry token，并明确关闭 SDK 自动重试。
+- 使用固定实例名和管理标签识别目标；重命名已有目标仍通过标签检测。
+- 创建成功后永久写为 `completed`。即使以后你手动删除那台实例，工作流也不会自动补建。
+- 已存在状态分支但状态文件丢失时停止，不把它当作首次启动。
+- 状态不包含 OCI 凭据、公网 IP 或原始资源 OCID，实例只记哈希。
 
-```bash
-# Install dependencies (once only)
-pip install oci
+请保留状态分支的记录。人工删除整个状态分支、修改源码、其他工具并行创建资源等外部操作不在本程序的并发锁范围内。API 读取和创建也不是跨云原子事务，因此应避免在抢注任务活动期间另行扩容、建卷或手动创建另一台 E2。
 
-# Run ARM version
-python oci_retry.py
+## 6. 成功通知
 
-# Run Micro version
-python oci_retry_micro.py
-```
+成功后会创建一条 Issue 并指派 `Jeinse`，正文给出对应的工作流运行链接；工作流 Summary 也会保存结果。手机推送或邮件取决于你自己的 GitHub 通知设置。通知失败不会重新创建实例，完成状态会先保存。
 
-### Local OCI Config File Required
+“CREATION_ACCEPTED”指 OCI 已接受创建、常见状态是 PROVISIONING，不是保证已经启动完成或 SSH 可达。去 OCI 实例页确认启动和公网 IP，使用你自己的 SSH 私钥连接。
 
-**Location**: `~/.oci/config` (on Windows: `C:\Users\YourName\.oci\config`, no file extension)
+Fork 仓库默认可能关闭 Issues。本次已为成功通知启用 Issues；如之后关闭，仍会保留运行日志与 Summary，但不能保证收到 Issue 通知。
 
-```
-[DEFAULT]
-user=ocid1.user.oc1..xxxxxx
-fingerprint=xx:xx:xx:xx:xx
-tenancy=ocid1.tenancy.oc1..xxxxxx
-region=ap-singapore-1
-key_file=C:\Users\YourName\Desktop\private-key.pem
-```
+## 7. 已验证与尚未执行
 
-**How to get config values**:
-1. Oracle Cloud Console → top-right avatar → **User settings**
-2. Left menu → **My profile** → top menu → **Tokens and keys** → **Add API key**
-3. Choose **Generate API key pair** → download the private key (`.pem` file)
-4. Click **Add** → copy the configuration snippet that appears, paste it into your `config` file
-5. Update `key_file` to the actual path of your `.pem` file
+代码已通过离线模拟测试，并使用真实 OCI SDK `2.189.0` 检查模型与方法参数。测试不需要用户密钥，不访问真实云账号。详见 [安全检查报告](docs/SAFETY_REVIEW.md)。
 
-### Script Behavior
+本次交付没有运行 GitHub Actions，没有设置 OCI Secrets/Variables，没有部署 active 调度，没有提交 OCI 创建请求。首次只读联调及实际启动由你在正常 GitHub 页面完成。
 
-| Status | Description |
-|--------|-------------|
-| Initializing | Auto-creates VCN + subnet (skips if already exists) |
-| Retry loop | Attempts every `RETRY_INTERVAL` seconds |
-| Out of capacity | Prints ❌ and keeps retrying |
-| Network timeout | Prints ⚠️ and keeps retrying (won't crash) |
-| Success | Prints ✅ instance ID and stops automatically |
+GitHub cron 只在默认分支运行，不保证准时；公开仓库长时间无活动可能自动停用定时工作流。查看 Actions 页面确认调度状态。
 
----
-
-## GitHub Actions — Automated 24/7 Retry (Recommended)
-
-No need to keep your computer running. GitHub Actions retries continuously, 24 hours a day.
-
-### How It Works
-
-```
-Job starts
-  └─ Attempts every 90 seconds for ~330 minutes (~220 tries)
-       ├─ Instance claimed → workflow auto-disables, done
-       └─ Timeout → immediately triggers next Job (virtually no gap)
-                        └─ Repeats...
-
-If the chain breaks: manually go to the Actions tab and click Run workflow again
-```
-
-| Item | Details |
-|------|---------|
-| Duration per Job | ~330 minutes (~220 attempts) |
-| Relay method | Auto-triggers next Job on exit, virtually no gap |
-| Max concurrency | 1 running + 1 queued (no pile-up) |
-| If chain breaks | Manually trigger from Actions tab |
-| After success | Workflow auto-disables — no manual action needed |
-| ARM vs Micro | Separate workflows, can run simultaneously |
-
----
-
-## Setup Steps
-
-### Step 1: Create a GitHub Repository
-
-Create a **public** repository (public repos get unlimited Actions minutes).
-
-### Step 2: Generate OCI API Key
-
-1. Oracle Cloud Console → top-right avatar → **User settings**
-2. Left menu → **My profile** → top menu → **Tokens and keys** → **Add API key**
-3. Choose **Generate API key pair** → download the private key (`.pem` file)
-4. Click **Add** → from the configuration snippet, note these values:
-   - `user`, `fingerprint`, `tenancy`, `region`
-
-### Step 3: Create a GitHub Personal Access Token (PAT)
-
-The PAT allows the workflow to auto-disable itself after success, or trigger the next Job.
-
-1. GitHub → top-right avatar → **Settings**
-2. Bottom of left sidebar → **Developer settings**
-3. **Personal access tokens** → **Tokens (classic)**
-4. **Generate new token (classic)**
-5. Fill in:
-   - **Note**: any name, e.g. `oci-retry`
-   - **Expiration**: as needed (recommend 90 days or No expiration)
-   - **Scopes**: check **`workflow`** (required to manage workflows)
-6. Click **Generate token** → **copy immediately** (shown only once)
-
-### Step 4: Set GitHub Secrets
-
-Go to your repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
-
-You need **6 secrets** in total:
-
-| Secret Name | Value | Where to Get It |
-|-------------|-------|----------------|
-| `OCI_USER` | `ocid1.user.oc1..xxxxxx` | Oracle Console → My profile → OCID |
-| `OCI_FINGERPRINT` | `xx:xx:xx:xx:xx` | Oracle Console → My profile → API keys → Fingerprint |
-| `OCI_TENANCY` | `ocid1.tenancy.oc1..xxxxxx` | Oracle Console → My profile → Tenancy OCID |
-| `OCI_REGION` | e.g. `ap-singapore-1` | Oracle Console top-right region name |
-| `OCI_PRIVATE_KEY` | Full contents of `.pem` file | Open the `.pem` from Step 2, copy everything (including `-----BEGIN/END PRIVATE KEY-----`) |
-| `GH_PAT` | GitHub Personal Access Token | Token generated in Step 3 |
-
-### Step 5: Push Code to GitHub
+## 本地离线验证
 
 ```bash
-git remote add origin https://github.com/your-username/your-repo.git
-git branch -M main
-git push -u origin main
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m unittest discover -s tests -v
 ```
 
-### Step 6: Start the Workflow
+正常运行脚本需要 GitHub Actions 上下文；本地直接运行不会创建实例。
 
-1. Go to your repository → **Actions** tab
-2. If the workflow shows as disabled, click **Enable workflow**
-3. Click **Run workflow** to trigger the first run manually
+## 官方参考
 
-ARM and Micro have separate workflows and can run simultaneously.
-
----
-
-## After Success
-
-Once an instance is claimed, the workflow **auto-disables** — no manual action needed.
-
-Go to Oracle Cloud Console → **Compute** → **Instances** → find your instance's public IP, then SSH in:
-
-```bash
-ssh -i private-key.pem ubuntu@your-public-ip
-```
-
----
-
-## Notes
-
-- `COMPARTMENT_ID` and `SSH_PUBLIC_KEY` in the script are safe to commit (non-sensitive)
-- Sensitive values (OCI API private key, PAT) are stored in GitHub Secrets and never committed
-- `.pem` / `.key` / `.pub` files are in `.gitignore` and won't be tracked
-
----
----
-
-<a name="繁體中文"></a>
-# 繁體中文
-
-## 兩種腳本
-
-| 腳本 | 目標機型 | 規格 | 架構 |
-|------|---------|------|------|
-| `oci_retry.py` | VM.Standard.A1.Flex | 2 OCPU / 12 GB RAM / 100 GB 磁碟 | ARM (Ampere) |
-| `oci_retry_micro.py` | VM.Standard.E2.1.Micro | 1 OCPU / 1 GB RAM / 50 GB 磁碟 | x86 |
-
-兩種都是 Oracle Always Free 永久免費方案。從 `2026-06-15` 起，Oracle 官方文件已將 Always Free Ampere A1 配額更新為每個 tenancy 總共 `2 OCPU + 12 GB RAM`，Micro 則仍可最多建立 2 台。
-
-> 📌 **官方更新（2026-06-15 起）：** Oracle 官方 Always Free 頁面現在明確寫明 Ampere A1 為每個 tenancy **2 OCPU + 12 GB RAM**，而免費的 boot volume + block volume 儲存總額則是 **每個 region 共 200 GB**。  
-> 官方來源：https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm
-
----
-
-## 兩種使用方式
-
-| 方式 | 適合對象 | 優點 | 缺點 |
-|------|---------|------|------|
-| 本機執行 | 想快速試試 | 不需要 GitHub 帳號設定 | 電腦要一直開著 |
-| GitHub Actions（推薦）| 長期自動搶機 | 24 小時不間斷，不佔電腦資源 | 需要 **public 倉庫** + 設定 Secrets |
-
-> 💡 **為什麼需要 public 倉庫？** Public 倉庫可以免費使用無限制的 GitHub Actions 分鐘數。Private 倉庫每月有上限。
-
----
-
-## 腳本設定
-
-開啟腳本，修改最上方的變數：
-
-### ARM 腳本：`oci_retry.py`
-
-```python
-COMPARTMENT_ID = "ocid1.tenancy.oc1..你的OCID"
-SSH_PUBLIC_KEY = "ssh-rsa AAAA...你的公開金鑰內容"
-INSTANCE_NAME = "streamlit-server"
-ARM_OCPUS = 2
-ARM_MEMORY_IN_GBS = 12
-BOOT_VOLUME_SIZE_IN_GBS = 100
-RETRY_INTERVAL = 90  # 重試間隔（秒）
-```
-
-> ARM 腳本現在把 `BOOT_VOLUME_SIZE_IN_GBS` 抽成可調整的設定變數，預設為 `100 GB`。這比舊版 `200 GB` 更安全，較不容易一次把 Always Free 的 `200 GB` 區域儲存額度吃滿。
-
-### Micro 腳本：`oci_retry_micro.py`
-
-```python
-COMPARTMENT_ID = "ocid1.tenancy.oc1..你的OCID"
-SSH_PUBLIC_KEY = "ssh-rsa AAAA...你的公開金鑰內容"
-INSTANCE_NAME  = "micro-server"   # 搶第二台時改成 "micro-server-2"，方便在 OCI Console 區分
-BOOT_VOLUME_SIZE_IN_GBS = 50
-RETRY_INTERVAL = 90  # 重試間隔（秒）
-```
-
-> 每個 OCI 帳號最多可以有 **2 台免費 Micro**。搶第二台時，將 `INSTANCE_NAME` 改成不同的名稱（例如 `"micro-server-2"`），方便在 OCI Console 區分。VCN 和子網路會自動共用，不需要另外建立。
-
-### 取得 Compartment ID（租用戶 OCID）
-
-**用途**：告訴 Oracle 要在哪個帳號下建立資源
-
-1. Oracle Cloud 主控台 → 右上角頭像 → **租用戶: XXX**
-2. 或：左上角選單 → **識別與安全** → **身份識別** → **區間** → 點（根）root
-3. 複製 OCID（格式：`ocid1.tenancy.oc1..xxxxxx`）
-
-### 取得 SSH 公開金鑰
-
-**用途**：建立 instance 後用來 SSH 連線進入 server
-
-1. 在 Oracle Cloud 建立 instance 時，選「**產生金鑰組**」（Generate key pair）
-2. 下載兩個檔案：
-   - `*.key` 或 `*.pem`（私密金鑰，自己保管，連線時用）
-   - `*.pub`（公開金鑰，填入腳本）
-3. 用記事本開啟 `.pub` 檔，複製全部內容（格式：`ssh-rsa AAAA...` 開頭）
-
-或在本機執行 `ssh-keygen` 自己產生。
-
----
-
-## 本機執行
-
-```bash
-# 安裝套件（只需一次）
-pip install oci
-
-# 執行 ARM 版
-python oci_retry.py
-
-# 執行 Micro 版
-python oci_retry_micro.py
-```
-
-### 本機執行需要 OCI 設定檔
-
-**儲存位置**：`C:\Users\你的帳號\.oci\config`（建立資料夾和檔案，檔案無副檔名）
-
-```
-[DEFAULT]
-user=ocid1.user.oc1..xxxxxx
-fingerprint=xx:xx:xx:xx:xx
-tenancy=ocid1.tenancy.oc1..xxxxxx
-region=ap-singapore-1
-key_file=C:\Users\你的帳號\Desktop\私密金鑰.pem
-```
-
-**取得設定檔內容**：
-1. Oracle Cloud 主控台 → 右上角頭像 → **使用者設定值**（User settings）
-2. 左側選單 → **我的設定檔**（My profile）→ 上方選單 → **權杖和金鑰**（Tokens and keys）→ **新增 API 金鑰**（Add API key）
-3. 選「**產生 API 金鑰組**」（Generate API key pair）→ 下載私密金鑰（`.pem` 檔）
-4. 按「新增」→ 複製出現的設定文字，貼入 `config` 檔
-5. 把 `key_file` 的路徑改成 `.pem` 檔的實際存放位置
-
-### 腳本執行行為
-
-| 狀態 | 說明 |
-|------|------|
-| 初始化 | 自動建立 VCN + 子網路（已存在則跳過）|
-| 搶機循環 | 每隔 `RETRY_INTERVAL` 秒嘗試一次 |
-| 容量不足 | 印出 ❌ 並繼續重試 |
-| 網路逾時 | 印出 ⚠️ 並繼續重試（不會當掉）|
-| 成功 | 印出 ✅ instance ID 並自動停止 |
-
----
-
-## GitHub Actions 自動搶機（推薦）
-
-不需要電腦一直開著，24 小時不間斷自動重試。
-
-### 運作方式
-
-```
-Job 開始
-  └─ 每 90 秒嘗試一次，持續約 330 分鐘（~220 次）
-       ├─ 搶到了 → 自動停用 workflow，結束
-       └─ timeout → 立刻觸發下一個 Job，空窗幾乎為零
-                        └─ 重複循環...
-
-鏈條中斷時：手動到 Actions 頁籤再按一次 Run workflow
-```
-
-| 項目 | 說明 |
-|------|------|
-| 每次 Job 持續時間 | 約 330 分鐘（~220 次嘗試）|
-| 接力方式 | Job 結束時自動觸發下一個，空窗幾乎為零 |
-| 同時執行上限 | 最多 1 個跑 + 1 個排隊（不會累積）|
-| 鏈條中斷時 | 手動到 Actions 頁籤再按一次 Run workflow |
-| 搶到後 | workflow 自動停用，完全不需要手動操作 |
-| ARM 與 Micro | 各自獨立 workflow，可同時執行互不干擾 |
-
----
-
-## 設定步驟
-
-### Step 1：建立 GitHub 倉庫
-
-建立 **public** 倉庫（public 才有無限制的 Actions 分鐘數）。
-
-### Step 2：產生 OCI API 金鑰
-
-1. Oracle Cloud 主控台 → 右上角頭像 → **使用者設定值**（User settings）
-2. 左側選單 → **我的設定檔**（My profile）→ 上方選單 → **權杖和金鑰**（Tokens and keys）→ **新增 API 金鑰**（Add API key）
-3. 選「**產生 API 金鑰組**」（Generate API key pair）→ 下載私密金鑰（`.pem` 檔）
-4. 按「新增」後複製出現的設定文字，從中取得以下值：
-   - `user`、`fingerprint`、`tenancy`、`region`
-
-### Step 3：建立 GitHub Personal Access Token（PAT）
-
-PAT 讓 workflow 搶到機器後能自動停用自己、或接力觸發下一個 Job。
-
-1. GitHub → 右上角頭像 → **Settings**
-2. 左側最下方 → **Developer settings**
-3. **Personal access tokens** → **Tokens (classic)**
-4. **Generate new token (classic)**
-5. 填寫：
-   - **Note**：隨意命名，例如 `oci-retry`
-   - **Expiration**：依需求設定（建議 90 天或 No expiration）
-   - **Scopes**：勾選 **`workflow`**（必須勾，才能操作 workflow）
-6. 點 **Generate token** → **立刻複製**產生的 token（只顯示一次）
-
-### Step 4：設定 GitHub Secrets
-
-到倉庫 → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
-
-共需設定 **6 個** secret：
-
-| Secret 名稱 | 填入的值 | 取得位置 |
-|------------|---------|----------|
-| `OCI_USER` | `ocid1.user.oc1..xxxxxx` | OCI 主控台 → 我的設定檔 → OCID |
-| `OCI_FINGERPRINT` | `xx:xx:xx:xx:xx` | OCI 主控台 → 我的設定檔 → API 金鑰 → 指紋 |
-| `OCI_TENANCY` | `ocid1.tenancy.oc1..xxxxxx` | OCI 主控台 → 右上角頭像 → 租用戶: XXX → 租用戶 OCID |
-| `OCI_REGION` | 例如 `ap-singapore-1` | OCI 主控台右上角區域名稱 |
-| `OCI_PRIVATE_KEY` | `.pem` 檔案完整內容 | 開啟 Step 2 下載的 `.pem` 檔，複製全部文字（含頭尾 `-----BEGIN/END PRIVATE KEY-----`）|
-| `GH_PAT` | GitHub Personal Access Token | Step 3 產生的 token |
-
-### Step 5：推送程式碼到 GitHub
-
-```bash
-git remote add origin https://github.com/你的帳號/你的倉庫名稱.git
-git branch -M main
-git push -u origin main
-```
-
-### Step 6：啟動 workflow
-
-1. 到倉庫 → **Actions** 頁籤
-2. 若 workflow 顯示停用，點 **Enable workflow**
-3. 點 **Run workflow** 手動立刻觸發第一次
-
-ARM 和 Micro 各自有獨立的 workflow，可以同時啟動。
-
----
-
-## 成功後
-
-搶到 instance 後，workflow 會**自動停用**，不需要任何手動操作。
-
-到 Oracle Cloud 主控台 → **Compute** → **執行處理** → 查看公用 IP，即可 SSH 連線：
-
-```bash
-ssh -i 私密金鑰.pem ubuntu@公用IP
-```
-
----
-
-## 注意事項
-
-- `COMPARTMENT_ID` 和 `SSH_PUBLIC_KEY` 寫在腳本裡是安全的（非機密資訊）
-- OCI API 私密金鑰、PAT 等敏感資訊全部放在 GitHub Secrets，不進版本控制
-- `.pem` / `.key` / `.pub` 已加入 `.gitignore`，不會被 commit
+- [Oracle Always Free](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm)
+- [OCI Python ComputeClient](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/client/oci.core.ComputeClient.html)
+- [GitHub schedule 行为](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+- [GitHub workflow token 权限](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication)

@@ -1,80 +1,81 @@
-name: OCI Micro Retry
+name: E2 Micro - one attempt every 30 minutes
+run-name: E2 Micro | ${{ inputs.operation || 'scheduled tick' }}
 
 on:
-  workflow_dispatch:  # Manual trigger only
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'plan=只读检查; start=手动授权并启动; pause=暂停; status=状态'
+        type: choice
+        options: [plan, start, pause, status]
+        default: plan
+        required: true
+      confirmation:
+        description: '仅 start：输入 CREATE_ONE_E2_MICRO，授权最多创建一台'
+        type: string
+        required: false
+  schedule:
+    # Avoid the top of the hour. UTC; intended interval is 30 minutes.
+    - cron: '17,47 * * * *'
 
+permissions: {}
 concurrency:
-  group: oci-retry-micro      # Separate from ARM workflow, no interference
-  cancel-in-progress: false   # Do not cancel running jobs; new ones queue (max 1 running + 1 waiting)
+  group: e2-micro-single-campaign
+  cancel-in-progress: false
 
 jobs:
-  retry:
+  micro:
+    if: github.repository_owner == 'Jeinse' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 355      # Close to GitHub Actions 6-hour limit
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Suppress Node.js 20 deprecation warning
-
+    timeout-minutes: 10
+    permissions:
+      contents: write  # Journal branch only; no PAT or Actions administration permission.
+      issues: write    # Success notice assigned to repository owner.
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Checkout reviewed code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          python-version: '3.11'
-
-      - name: Install OCI SDK
-        run: pip install oci
-
-      - name: Set up OCI credentials
+          persist-credentials: false
+      - name: Read campaign gate without OCI credentials
+        id: gate
         env:
-          OCI_USER:        ${{ secrets.OCI_USER }}
+          GITHUB_TOKEN: ${{ github.token }}
+          OPERATION: ${{ github.event_name == 'schedule' && 'tick' || inputs.operation }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from github_state import GitHubState
+          from oci_retry_micro import require
+          state = GitHubState.from_env().load()
+          require(state.get('mode') in {'paused','active','halted','uncertain','completed'}, 'INVALID_STATE')
+          proceed = os.environ['OPERATION'] != 'tick' or state['mode'] == 'active'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('proceed=' + str(proceed).lower() + '\n')
+          print('Campaign mode: ' + state['mode'])
+          PYTHON
+      - name: Set up Python
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned OCI SDK
+        if: steps.gate.outputs.proceed == 'true' && (github.event_name == 'schedule' || inputs.operation == 'plan' || inputs.operation == 'start')
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Check or execute the manually armed campaign
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OPERATION: ${{ github.event_name == 'schedule' && 'tick' || inputs.operation }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          OCI_REGION: ap-singapore-1
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_TENANCY:     ${{ secrets.OCI_TENANCY }}
-          OCI_REGION:      ${{ secrets.OCI_REGION }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
-        run: |
-          mkdir -p ~/.oci
-
-          # Write API private key
-          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
-
-          # Write config (key_file uses absolute path)
-          cat > ~/.oci/config << EOF
-          [DEFAULT]
-          user=$OCI_USER
-          fingerprint=$OCI_FINGERPRINT
-          tenancy=$OCI_TENANCY
-          region=$OCI_REGION
-          key_file=/home/runner/.oci/oci_api_key.pem
-          EOF
-
-      - name: Run OCI retry script
-        # Script succeeds (exit 0)  → next step auto-disables the workflow
-        # Timeout expires (exit 124) → treated as failure, triggers next Job
-        # timeout 19800s = 330 min, 25 min less than job timeout 355 min (buffer for setup steps)
-        id: run_script
-        continue-on-error: true
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: timeout 19800 python oci_retry_micro.py
-
-      - name: Auto-disable workflow on success
-        if: steps.run_script.outcome == 'success'
-        run: |
-          curl -s -X PUT \
-            -H "Authorization: token ${{ secrets.GH_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry_micro.yml/disable
-          echo "Workflow auto-disabled"
-
-      - name: Trigger next Job (seamless relay)
-        if: steps.run_script.outcome != 'success'
-        run: |
-          curl -s -X POST \
-            -H "Authorization: token ${{ secrets.GH_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry_micro.yml/dispatches \
-            -d '{"ref":"main"}'
-          echo "Next Job triggered"
+          OCI_KEY_PASSPHRASE: ${{ secrets.OCI_KEY_PASSPHRASE }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          OCI_COMPARTMENT_ID: ${{ vars.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ vars.OCI_SUBNET_ID }}
+          OCI_IMAGE_ID: ${{ vars.OCI_IMAGE_ID }}
+          OCI_FREE_CONFIG_APPROVED: ${{ vars.OCI_FREE_CONFIG_APPROVED }}
+        run: python oci_retry_micro.py --operation "$OPERATION"
